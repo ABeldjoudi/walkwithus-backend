@@ -49,3 +49,4 @@ We may update this Privacy Policy from time to time. Any changes will be posted 
 9. Contact Us
 If you have questions or requests regarding this Privacy Policy, please contact us at:
 Email: kbeldjoudi@hotmail.com
+© 2025 WalkWithUs. All rights reserved.
