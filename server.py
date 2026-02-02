@@ -33,7 +33,8 @@ SENDGRID_FROM_EMAIL = os.environ.get('SENDGRID_FROM_EMAIL')
 # Admin emails (users with these emails have admin access)
 ADMIN_EMAILS = [
     "kbeldjoudi@hotmail.com",
-    "abdelkaderbeldjoudi@gmail.com"
+    "abdelkaderbeldjoudi@gmail.com",
+    "abdelkaderbeldjoudi8@gmail.com"
 ]
 
 # Create the main app without a prefix
