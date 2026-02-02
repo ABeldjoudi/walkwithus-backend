@@ -1914,6 +1914,16 @@ async def create_booking(
     if not walk:
         raise HTTPException(status_code=404, detail="Walk not found")
     
+    # Hard limit of 10 participants - no bookings beyond this
+    HARD_LIMIT = 10
+    current_participants = await db.bookings.count_documents({
+        "walk_id": booking_data.walk_id,
+        "status": "active"
+    })
+    
+    if current_participants >= HARD_LIMIT:
+        raise HTTPException(status_code=400, detail=f"This walk has reached the maximum limit of {HARD_LIMIT} participants")
+    
     # Check if already booked
     existing = await db.bookings.find_one({
         "walk_id": booking_data.walk_id,
