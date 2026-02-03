@@ -2347,9 +2347,8 @@ async def get_admin_messages(
     limit: int = 50
 ):
     """Get all messages sent to admins (admin only)"""
-    # Check if user is admin
-    user_doc = await db.users.find_one({"user_id": current_user.user_id})
-    if not user_doc or not user_doc.get("is_admin"):
+    # Check if user is admin using email list
+    if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     messages = await db.admin_messages.find(
@@ -2373,8 +2372,7 @@ async def mark_message_read(
     current_user: User = Depends(get_current_user)
 ):
     """Mark an admin message as read"""
-    user_doc = await db.users.find_one({"user_id": current_user.user_id})
-    if not user_doc or not user_doc.get("is_admin"):
+    if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     result = await db.admin_messages.update_one(
@@ -2401,8 +2399,7 @@ async def search_users(
     
     Search uses OR logic - any matching field will return the user.
     """
-    user_doc = await db.users.find_one({"user_id": current_user.user_id})
-    if not user_doc or not user_doc.get("is_admin"):
+    if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Build query using OR logic - any matching field will return user
@@ -2461,8 +2458,7 @@ async def get_user_details(
     current_user: User = Depends(get_current_user)
 ):
     """Get detailed information about a specific user (admin only)"""
-    admin_doc = await db.users.find_one({"user_id": current_user.user_id})
-    if not admin_doc or not admin_doc.get("is_admin"):
+    if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     # Get user info
