@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -256,19 +256,20 @@ async def notify_previous_participants(walk: dict):
                     continue  # Skip users without age set
                 
                 # Check if user's age falls within any of the required age groups
+                # Non-overlapping ranges: 18-24, 25-34, 35-44, 45-54, 55-64, 65-74, 75+
                 age_match = False
                 for age_group in walk_age_groups:
-                    if age_group == "18-25" and 18 <= user_age <= 25:
+                    if age_group == "18-24" and 18 <= user_age <= 24:
                         age_match = True
-                    elif age_group == "25-35" and 25 <= user_age <= 35:
+                    elif age_group == "25-34" and 25 <= user_age <= 34:
                         age_match = True
-                    elif age_group == "35-45" and 35 <= user_age <= 45:
+                    elif age_group == "35-44" and 35 <= user_age <= 44:
                         age_match = True
-                    elif age_group == "45-55" and 45 <= user_age <= 55:
+                    elif age_group == "45-54" and 45 <= user_age <= 54:
                         age_match = True
-                    elif age_group == "55-65" and 55 <= user_age <= 65:
+                    elif age_group == "55-64" and 55 <= user_age <= 64:
                         age_match = True
-                    elif age_group == "65-75" and 65 <= user_age <= 75:
+                    elif age_group == "65-74" and 65 <= user_age <= 74:
                         age_match = True
                     elif age_group == "75+" and user_age >= 75:
                         age_match = True
@@ -496,6 +497,17 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    reset_code: str
+    new_password: str
+
+# GeoNames configuration
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME", "demo")  # Replace with actual username
+
 class User(BaseModel):
     user_id: str
     email: str
@@ -525,7 +537,7 @@ class SessionDataResponse(BaseModel):
 
 class WalkConditions(BaseModel):
     sex: Optional[List[str]] = None  # ["Male", "Female"] - can be both or one
-    age_groups: Optional[List[str]] = None  # ["18-25", "25-35", etc.] - can be multiple
+    age_groups: Optional[List[str]] = None  # ["18-24", "25-34", etc.] - non-overlapping ranges
     country_region: Optional[str] = None  # Free text for country/region
 
 class Walk(BaseModel):
@@ -580,6 +592,9 @@ class Booking(BaseModel):
     user_email: str
     booked_at: datetime
     status: str = "active"  # "active" or "cancelled"
+    # Enhanced fields - populated by get_my_bookings endpoint
+    walk_title: Optional[str] = None
+    walk_date: Optional[str] = None
 
 class BookingCreate(BaseModel):
     walk_id: str
@@ -663,6 +678,14 @@ class WalkerExperienceCreate(BaseModel):
 
 class AdminMessage(BaseModel):
     message: str
+
+class ContentReport(BaseModel):
+    content_type: str  # "feedback", "experience", "walk"
+    content_id: Optional[str] = None
+    reported_user_name: Optional[str] = None
+    walk_title: Optional[str] = None
+    walk_date: Optional[str] = None
+    description: str  # User's description of the issue
 
 class UserProfileUpdate(BaseModel):
     pseudonym: Optional[str] = None  # Display name for bookings and feedback
@@ -812,7 +835,10 @@ async def create_session(request: Request, response: Response):
             path="/"
         )
         
-        return User(**user_doc)
+        # Return user data with session_token for mobile clients
+        user_response = User(**user_doc).dict()
+        user_response["session_token"] = session_token
+        return user_response
         
     except HTTPException:
         raise
@@ -914,7 +940,10 @@ async def apple_auth(apple_data: AppleAuthRequest, response: Response):
             path="/"
         )
         
-        return User(**user_doc)
+        # Return user data with session_token for mobile clients
+        user_response = User(**user_doc).dict()
+        user_response["session_token"] = session_token
+        return user_response
         
     except HTTPException:
         raise
@@ -1081,6 +1110,104 @@ async def make_admin(email: str, current_user: User = Depends(get_current_user))
         raise HTTPException(status_code=404, detail="User not found")
     
     return {"message": f"User {email} is now an admin"}
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    """Request a password reset - generates a 6-digit code"""
+    import random
+    import string
+    
+    email = request.email.lower().strip()
+    logging.info(f"[ForgotPassword] Looking up user: {email}")
+    
+    # Check if user exists with email/password auth
+    user = await db.users.find_one({"email": email})
+    logging.info(f"[ForgotPassword] User found: {user is not None}")
+    
+    if not user:
+        # Don't reveal if email exists or not for security
+        logging.info(f"[ForgotPassword] User not found, returning generic message")
+        return {"message": "If an account exists with this email, a reset code has been generated."}
+    
+    # Check if user has password auth (not just Google/Apple)
+    has_password = "password_hash" in user
+    logging.info(f"[ForgotPassword] Has password_hash: {has_password}")
+    
+    if not has_password:
+        return {"message": "This account uses Google or Apple Sign-In. Please use that method to log in."}
+    
+    # Generate 6-digit reset code
+    reset_code = ''.join(random.choices(string.digits, k=6))
+    
+    # Store reset code with expiration (15 minutes)
+    await db.password_resets.update_one(
+        {"email": email},
+        {
+            "$set": {
+                "email": email,
+                "reset_code": reset_code,
+                "created_at": datetime.now(timezone.utc),
+                "expires_at": datetime.now(timezone.utc) + timedelta(minutes=15),
+                "used": False
+            }
+        },
+        upsert=True
+    )
+    
+    logging.info(f"Password reset code generated for {email}: {reset_code}")
+    
+    # In production, you would send this via email
+    # For now, we return it (you can set up email later)
+    return {
+        "message": "Reset code generated. Check your email.",
+        "reset_code": reset_code,  # Remove this line in production when email is set up
+        "expires_in_minutes": 15
+    }
+
+@api_router.post("/auth/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    """Reset password using the reset code"""
+    email = request.email.lower().strip()
+    
+    # Find the reset request
+    reset_request = await db.password_resets.find_one({
+        "email": email,
+        "reset_code": request.reset_code,
+        "used": False
+    })
+    
+    if not reset_request:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    
+    # Check if code has expired
+    if datetime.now(timezone.utc) > reset_request["expires_at"]:
+        raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
+    
+    # Validate new password
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    # Hash new password
+    new_password_hash = hash_password(request.new_password)
+    
+    # Update user password
+    result = await db.users.update_one(
+        {"email": email},
+        {"$set": {"password_hash": new_password_hash}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Mark reset code as used
+    await db.password_resets.update_one(
+        {"_id": reset_request["_id"]},
+        {"$set": {"used": True}}
+    )
+    
+    logging.info(f"Password reset successful for {email}")
+    
+    return {"message": "Password has been reset successfully. You can now log in with your new password."}
 
 @api_router.put("/auth/profile")
 async def update_profile(
@@ -1577,6 +1704,11 @@ async def get_walks(
     # Get walks matching city and date
     walks = await db.walks.find(query, {"_id": 0}).sort("date", 1).to_list(1000)
     
+    # Get current date and time for filtering today's walks that have already passed
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    current_time_minutes = now.hour * 60 + now.minute
+    
     # Get user's booked walk IDs to exclude already booked walks
     user_bookings = await db.bookings.find(
         {"user_id": current_user.user_id, "status": "active"},
@@ -1593,6 +1725,28 @@ async def get_walks(
         # Skip walks the user has already booked (they appear in My Schedule)
         if walk["walk_id"] in booked_walk_ids:
             continue
+        
+        # Skip walks that are today but the time has already passed
+        walk_date = walk.get("date", "")
+        walk_time = walk.get("time", "")
+        if walk_date == today_str and walk_time:
+            # Parse the walk time (format: "HH:MM" or "H:MM")
+            try:
+                time_parts = walk_time.split(":")
+                if len(time_parts) >= 2:
+                    walk_hour = int(time_parts[0])
+                    walk_minute = int(time_parts[1].split()[0])  # Handle "2:30 PM" format
+                    # Check for AM/PM
+                    if "PM" in walk_time.upper() and walk_hour != 12:
+                        walk_hour += 12
+                    elif "AM" in walk_time.upper() and walk_hour == 12:
+                        walk_hour = 0
+                    walk_time_minutes = walk_hour * 60 + walk_minute
+                    if walk_time_minutes <= current_time_minutes:
+                        logging.info(f"Skipping walk '{walk.get('title')}' - time has passed ({walk_time} vs current {now.strftime('%H:%M')})")
+                        continue
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Could not parse walk time '{walk_time}': {e}")
         
         # Skip condition filtering for admin global view
         if not skip_condition_filters:
@@ -1617,19 +1771,20 @@ async def get_walks(
                 if user_age is None:
                     continue  # Skip if user hasn't set age and walk has age requirements
                 
+                # Non-overlapping age ranges: 18-24, 25-34, 35-44, 45-54, 55-64, 65-74, 75+
                 age_match = False
                 for age_group in conditions["age_groups"]:
-                    if age_group == "18-25" and 18 <= user_age <= 25:
+                    if age_group == "18-24" and 18 <= user_age <= 24:
                         age_match = True
-                    elif age_group == "25-35" and 25 <= user_age <= 35:
+                    elif age_group == "25-34" and 25 <= user_age <= 34:
                         age_match = True
-                    elif age_group == "35-45" and 35 <= user_age <= 45:
+                    elif age_group == "35-44" and 35 <= user_age <= 44:
                         age_match = True
-                    elif age_group == "45-55" and 45 <= user_age <= 55:
+                    elif age_group == "45-54" and 45 <= user_age <= 54:
                         age_match = True
-                    elif age_group == "55-65" and 55 <= user_age <= 65:
+                    elif age_group == "55-64" and 55 <= user_age <= 64:
                         age_match = True
-                    elif age_group == "65-75" and 65 <= user_age <= 75:
+                    elif age_group == "65-74" and 65 <= user_age <= 74:
                         age_match = True
                     elif age_group == "75+" and user_age >= 75:
                         age_match = True
@@ -1720,6 +1875,9 @@ async def get_reviewable_walks(
     current_user: User = Depends(get_current_user)
 ):
     """Get walks the user can review (booked but not yet reviewed)"""
+    import time
+    start = time.time()
+    
     # Get user's bookings
     bookings = await db.bookings.find(
         {"user_id": current_user.user_id},
@@ -1727,6 +1885,9 @@ async def get_reviewable_walks(
     ).to_list(1000)
     
     booked_walk_ids = [b["walk_id"] for b in bookings]
+    
+    t1 = time.time()
+    logging.info(f"[Reviewable] Got {len(booked_walk_ids)} bookings in {(t1-start)*1000:.0f}ms")
     
     if not booked_walk_ids:
         return []
@@ -1739,16 +1900,23 @@ async def get_reviewable_walks(
     
     reviewed_walk_ids = [r["walk_id"] for r in existing_reviews]
     
+    t2 = time.time()
+    logging.info(f"[Reviewable] Got {len(reviewed_walk_ids)} reviews in {(t2-t1)*1000:.0f}ms")
+    
     # Get walks that are booked but not reviewed
     reviewable_walk_ids = [wid for wid in booked_walk_ids if wid not in reviewed_walk_ids]
     
     if not reviewable_walk_ids:
+        logging.info(f"[Reviewable] Total: {(time.time()-start)*1000:.0f}ms - no reviewable walks")
         return []
     
     walks = await db.walks.find(
         {"walk_id": {"$in": reviewable_walk_ids}},
         {"_id": 0}
     ).to_list(100)
+    
+    t3 = time.time()
+    logging.info(f"[Reviewable] Total: {(t3-start)*1000:.0f}ms for {len(walks)} reviewable walks")
     
     return walks
 
@@ -1949,12 +2117,45 @@ async def create_booking(
 
 @api_router.get("/bookings", response_model=List[Booking])
 async def get_my_bookings(current_user: User = Depends(get_current_user)):
-    """Get current user's bookings"""
+    """Get current user's bookings with walk details (optimized - no N+1)"""
+    import time
+    start = time.time()
+    
     bookings = await db.bookings.find(
         {"user_id": current_user.user_id, "status": "active"},
         {"_id": 0}
     ).to_list(1000)
-    return [Booking(**booking) for booking in bookings]
+    
+    t1 = time.time()
+    logging.info(f"[Bookings] Fetched {len(bookings)} bookings in {(t1-start)*1000:.0f}ms")
+    
+    # Get all unique walk_ids from bookings
+    walk_ids = list(set(b.get("walk_id") for b in bookings if b.get("walk_id")))
+    
+    # Fetch all walks in ONE query (avoid N+1 problem)
+    walks_map = {}
+    if walk_ids:
+        walks = await db.walks.find(
+            {"walk_id": {"$in": walk_ids}},
+            {"walk_id": 1, "title": 1, "date": 1, "_id": 0}
+        ).to_list(1000)
+        walks_map = {w["walk_id"]: w for w in walks}
+    
+    t2 = time.time()
+    logging.info(f"[Bookings] Fetched {len(walks_map)} walks in {(t2-t1)*1000:.0f}ms")
+    
+    # Enrich bookings with walk details
+    enriched_bookings = []
+    for booking in bookings:
+        walk = walks_map.get(booking.get("walk_id"), {})
+        booking["walk_title"] = walk.get("title", "Unknown Walk")
+        booking["walk_date"] = walk.get("date", "Unknown Date")
+        enriched_bookings.append(Booking(**booking))
+    
+    t3 = time.time()
+    logging.info(f"[Bookings] Total: {(t3-start)*1000:.0f}ms for {len(enriched_bookings)} enriched bookings")
+    
+    return enriched_bookings
 
 @api_router.delete("/bookings/{booking_id}")
 async def cancel_booking(
@@ -2299,43 +2500,115 @@ async def send_admin_message(
     # Log for admins
     logging.info(f"📧 ADMIN MESSAGE from {current_user.name} ({current_user.email}): {message_data.message[:100]}...")
     
-    # Send email notification to all admins
+    # Send email notification to all admins in ADMIN_EMAILS list
     try:
-        admin_users = await db.users.find(
-            {"is_admin": True},
-            {"email": 1, "name": 1, "_id": 0}
-        ).to_list(20)
+        email_subject = f"WalkWithUs - New Message from {current_user.name}"
+        email_body = f"""
+        <h2>New Message from App User</h2>
+        <p><strong>From:</strong> {current_user.name}</p>
+        <p><strong>Email:</strong> {current_user.email}</p>
+        <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        <hr>
+        <p><strong>Message:</strong></p>
+        <p style="background-color: #f5f5f5; padding: 15px; border-radius: 5px;">
+            {message_data.message.strip()}
+        </p>
+        <hr>
+        <p><em>This message was sent via the WalkWithUs app contact form.</em></p>
+        """
         
-        if admin_users:
-            email_subject = f"WalkWithUs - New Message from {current_user.name}"
-            email_body = f"""
-            <h2>New Message from App User</h2>
-            <p><strong>From:</strong> {current_user.name}</p>
-            <p><strong>Email:</strong> {current_user.email}</p>
-            <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-            <hr>
-            <p><strong>Message:</strong></p>
-            <p style="background-color: #f5f5f5; padding: 15px; border-radius: 5px;">
-                {message_data.message.strip()}
-            </p>
-            <hr>
-            <p><em>This message was sent via the WalkWithUs app contact form.</em></p>
-            """
-            
-            for admin in admin_users:
-                if admin.get("email"):
-                    logging.info(f"📧 Sending admin message notification to {admin['email']}")
-                    await send_email_notification(admin["email"], email_subject, email_body)
-            
-            logging.info(f"✅ Admin message email sent to {len(admin_users)} admin(s)")
-        else:
-            logging.warning("⚠️ No admin users found to notify")
+        # Send to all admin emails in the ADMIN_EMAILS list
+        for admin_email in ADMIN_EMAILS:
+            logging.info(f"📧 Sending admin message notification to {admin_email}")
+            await send_email_notification(admin_email, email_subject, email_body)
+        
+        logging.info(f"✅ Admin message email sent to {len(ADMIN_EMAILS)} admin(s)")
             
     except Exception as e:
         logging.error(f"❌ Error sending admin message email: {e}")
         # Don't fail the request - message is already stored
     
     return {"message": "Message sent successfully"}
+
+
+@api_router.post("/report/content")
+async def report_non_compliant_content(
+    report_data: ContentReport,
+    current_user: User = Depends(get_current_user)
+):
+    """Report non-compliant content to admins"""
+    if not report_data.description or len(report_data.description.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Description must be at least 10 characters")
+    
+    if len(report_data.description) > 2000:
+        raise HTTPException(status_code=400, detail="Description too long (max 2000 characters)")
+    
+    # Store the report
+    content_report = {
+        "report_id": f"rpt_{uuid.uuid4().hex[:12]}",
+        "reporter_user_id": current_user.user_id,
+        "reporter_user_name": current_user.name,
+        "reporter_user_email": current_user.email,
+        "content_type": report_data.content_type,
+        "content_id": report_data.content_id,
+        "reported_user_name": report_data.reported_user_name,
+        "walk_title": report_data.walk_title,
+        "walk_date": report_data.walk_date,
+        "description": report_data.description.strip(),
+        "created_at": datetime.now(timezone.utc),
+        "status": "pending",  # pending, reviewed, resolved
+        "reviewed_by": None,
+        "reviewed_at": None
+    }
+    
+    await db.content_reports.insert_one(content_report)
+    
+    # Log for admins
+    logging.info(f"🚨 CONTENT REPORT from {current_user.name} ({current_user.email}): {report_data.content_type} - {report_data.description[:100]}...")
+    
+    # Send email notification to all admins
+    try:
+        email_subject = f"🚨 WalkWithUs - Content Report from {current_user.name}"
+        
+        # Build the details section
+        details = []
+        if report_data.reported_user_name:
+            details.append(f"<p><strong>Reported User:</strong> {report_data.reported_user_name}</p>")
+        if report_data.walk_title:
+            details.append(f"<p><strong>Walk Title:</strong> {report_data.walk_title}</p>")
+        if report_data.walk_date:
+            details.append(f"<p><strong>Walk Date:</strong> {report_data.walk_date}</p>")
+        
+        details_html = "".join(details) if details else ""
+        
+        email_body = f"""
+        <h2>🚨 Non-Compliant Content Report</h2>
+        <p><strong>Reported by:</strong> {current_user.name}</p>
+        <p><strong>Reporter Email:</strong> {current_user.email}</p>
+        <p><strong>Content Type:</strong> {report_data.content_type}</p>
+        <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        {details_html}
+        <hr>
+        <p><strong>Report Description:</strong></p>
+        <p style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+            {report_data.description.strip()}
+        </p>
+        <hr>
+        <p><em>This report requires admin review. Please check the reported content in the admin panel.</em></p>
+        """
+        
+        # Send to all admin emails in the ADMIN_EMAILS list
+        for admin_email in ADMIN_EMAILS:
+            logging.info(f"📧 Sending content report notification to {admin_email}")
+            await send_email_notification(admin_email, email_subject, email_body)
+        
+        logging.info(f"✅ Content report email sent to {len(ADMIN_EMAILS)} admin(s)")
+            
+    except Exception as e:
+        logging.error(f"❌ Error sending content report email: {e}")
+        # Don't fail the request - report is already stored
+    
+    return {"message": "Report submitted successfully. Thank you for helping keep our community safe."}
 
 
 # ============== Admin Messages & User Search API ==============
@@ -2384,6 +2657,103 @@ async def mark_message_read(
         raise HTTPException(status_code=404, detail="Message not found")
     
     return {"message": "Message marked as read"}
+
+
+@api_router.get("/admin/reports")
+async def get_content_reports(
+    current_user: User = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 50
+):
+    """Get all content reports (admin only)"""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    reports = await db.content_reports.find(
+        {},
+        {"_id": 0}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    total = await db.content_reports.count_documents({})
+    
+    return {
+        "reports": reports,
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }
+
+
+@api_router.put("/admin/reports/{report_id}/status")
+async def update_report_status(
+    report_id: str,
+    status: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Update a content report status (admin only)"""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    if status not in ["pending", "reviewed", "resolved"]:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be: pending, reviewed, or resolved")
+    
+    result = await db.content_reports.update_one(
+        {"report_id": report_id},
+        {"$set": {
+            "status": status,
+            "reviewed_by": current_user.email,
+            "reviewed_at": datetime.now(timezone.utc)
+        }}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    return {"message": f"Report status updated to {status}"}
+
+
+@api_router.get("/admin/feedback/all")
+async def get_all_feedback_admin(
+    current_user: User = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all feedback messages for admin moderation"""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    feedback_items = await db.feedback.find(
+        {},
+        {"_id": 0}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    total = await db.feedback.count_documents({})
+    
+    return {
+        "feedback": feedback_items,
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }
+
+
+@api_router.delete("/admin/feedback/{feedback_id}")
+async def delete_feedback_admin(
+    feedback_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Delete a feedback message (admin only)"""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    result = await db.feedback.delete_one({"feedback_id": feedback_id})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    
+    logging.info(f"🗑️ Admin {current_user.email} deleted feedback {feedback_id}")
+    
+    return {"message": "Feedback deleted successfully"}
 
 
 @api_router.get("/admin/users/search")
@@ -2738,21 +3108,21 @@ async def get_admin_statistics(
         sex = user.get("sex") or "Unknown"
         users_by_sex[sex] = users_by_sex.get(sex, 0) + 1
         
-        # By Age Group
+        # By Age Group - Non-overlapping ranges: 18-24, 25-34, 35-44, 45-54, 55-64, 65-74, 75+
         age = user.get("age")
         if age:
             if age < 25:
-                age_group = "18-25"
+                age_group = "18-24"
             elif age < 35:
-                age_group = "25-35"
+                age_group = "25-34"
             elif age < 45:
-                age_group = "35-45"
+                age_group = "35-44"
             elif age < 55:
-                age_group = "45-55"
+                age_group = "45-54"
             elif age < 65:
-                age_group = "55-65"
+                age_group = "55-64"
             elif age < 75:
-                age_group = "65-75"
+                age_group = "65-74"
             else:
                 age_group = "75+"
         else:
@@ -2857,6 +3227,124 @@ async def get_active_users_list():
 async def check_admin_status(current_user: User = Depends(get_current_user)):
     """Check if current user is an admin"""
     return {"is_admin": is_admin(current_user)}
+
+
+# ============== Walk Tracking Stats Endpoints ==============
+
+class WalkStatsSync(BaseModel):
+    distance: float  # meters
+    steps: int
+    calories: int
+    duration: float  # seconds
+    country: str = "Unknown"
+
+@api_router.post("/walk-stats/sync")
+async def sync_walk_stats(
+    stats: WalkStatsSync,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Sync aggregate walk tracking stats to server for admin statistics.
+    Only aggregate data is stored - no route/location data for privacy.
+    """
+    try:
+        # Store the walk stats
+        walk_stat = {
+            "user_id": current_user.user_id,
+            "country": stats.country or current_user.country or "Unknown",
+            "distance": stats.distance,
+            "steps": stats.steps,
+            "calories": stats.calories,
+            "duration": stats.duration,
+            "synced_at": datetime.now(timezone.utc)
+        }
+        
+        await db.walk_tracking_stats.insert_one(walk_stat)
+        
+        logging.info(f"📊 Walk stats synced: user={current_user.user_id}, distance={stats.distance}m, steps={stats.steps}")
+        
+        return {"message": "Stats synced successfully"}
+    except Exception as e:
+        logging.error(f"Error syncing walk stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to sync stats")
+
+@api_router.get("/admin/walk-tracking-stats")
+async def get_walk_tracking_stats(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get aggregated walk tracking statistics by country (admin only).
+    Used for marketing and app promotion.
+    """
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Aggregate stats by country
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$country",
+                    "total_walks": {"$sum": 1},
+                    "total_distance": {"$sum": "$distance"},
+                    "total_steps": {"$sum": "$steps"},
+                    "total_calories": {"$sum": "$calories"},
+                    "total_duration": {"$sum": "$duration"},
+                    "unique_users": {"$addToSet": "$user_id"}
+                }
+            },
+            {
+                "$project": {
+                    "country": "$_id",
+                    "total_walks": 1,
+                    "total_distance": 1,
+                    "total_steps": 1,
+                    "total_calories": 1,
+                    "total_duration": 1,
+                    "unique_users_count": {"$size": "$unique_users"}
+                }
+            },
+            {"$sort": {"total_distance": -1}}
+        ]
+        
+        stats_by_country = await db.walk_tracking_stats.aggregate(pipeline).to_list(1000)
+        
+        # Get unique users count first
+        unique_users = await db.walk_tracking_stats.distinct("user_id")
+        
+        # Calculate global totals
+        global_totals = {
+            "total_walks": sum(s["total_walks"] for s in stats_by_country),
+            "total_distance_km": round(sum(s["total_distance"] for s in stats_by_country) / 1000, 2),
+            "total_steps": sum(s["total_steps"] for s in stats_by_country),
+            "total_calories": sum(s["total_calories"] for s in stats_by_country),
+            "total_duration_hours": round(sum(s["total_duration"] for s in stats_by_country) / 3600, 1),
+            "total_duration_seconds": sum(s["total_duration"] for s in stats_by_country),
+            "total_countries": len(stats_by_country),
+            "total_unique_users": len(unique_users)
+        }
+        
+        # Format country stats for response
+        country_stats = []
+        for stat in stats_by_country:
+            country_stats.append({
+                "country": stat.get("country", "Unknown"),
+                "total_walks": stat["total_walks"],
+                "total_distance_km": round(stat["total_distance"] / 1000, 2),
+                "total_steps": stat["total_steps"],
+                "total_calories": stat["total_calories"],
+                "total_duration_hours": round(stat["total_duration"] / 3600, 1),
+                "unique_users": stat["unique_users_count"]
+            })
+        
+        return {
+            "global_totals": global_totals,
+            "by_country": country_stats
+        }
+    except Exception as e:
+        logging.error(f"Error getting walk tracking stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get stats")
+
 
 @api_router.post("/terms/accept")
 async def accept_terms(current_user: User = Depends(get_current_user)):
@@ -3107,6 +3595,194 @@ async def get_moderation_log(
     return logs
 
 
+# ============== GEONAMES API - Countries & Cities ==============
+
+@api_router.get("/geo/countries")
+async def get_countries():
+    """Get list of all countries from GeoNames"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"http://api.geonames.org/countryInfoJSON?username={GEONAMES_USERNAME}",
+                timeout=10.0
+            )
+            data = response.json()
+            
+            if "geonames" not in data:
+                # Fallback to static list if API fails
+                return {"countries": get_static_countries()}
+            
+            countries = []
+            for country in data["geonames"]:
+                countries.append({
+                    "name": country.get("countryName"),
+                    "code": country.get("countryCode"),
+                    "geonameId": country.get("geonameId")
+                })
+            
+            # Sort alphabetically
+            countries.sort(key=lambda x: x["name"])
+            return {"countries": countries}
+    except Exception as e:
+        logging.error(f"GeoNames API error: {e}")
+        # Return fallback static list
+        return {"countries": get_static_countries()}
+
+@api_router.get("/geo/cities/{country_code}")
+async def get_cities_by_country(country_code: str, query: str = ""):
+    """Get cities for a specific country from GeoNames
+    
+    Args:
+        country_code: ISO 2-letter country code (e.g., 'DZ' for Algeria)
+        query: Optional search query to filter cities
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use GeoNames search to get cities
+            params = {
+                "country": country_code.upper(),
+                "featureClass": "P",  # Populated places
+                "maxRows": 1000,
+                "username": GEONAMES_USERNAME,
+                "orderby": "population",
+                "cities": "cities1000"  # Cities with population > 1000
+            }
+            
+            if query:
+                params["name_startsWith"] = query
+            
+            response = await client.get(
+                "http://api.geonames.org/searchJSON",
+                params=params,
+                timeout=15.0
+            )
+            data = response.json()
+            
+            if "geonames" not in data:
+                logging.error(f"GeoNames response: {data}")
+                return {"cities": [], "error": "Failed to fetch cities"}
+            
+            cities = []
+            seen_names = set()  # Avoid duplicates
+            
+            for place in data["geonames"]:
+                city_name = place.get("name") or place.get("toponymName")
+                if city_name and city_name not in seen_names:
+                    seen_names.add(city_name)
+                    cities.append({
+                        "name": city_name,
+                        "adminName1": place.get("adminName1", ""),  # State/Province
+                        "population": place.get("population", 0),
+                        "geonameId": place.get("geonameId")
+                    })
+            
+            # Sort by population (largest first), then alphabetically
+            cities.sort(key=lambda x: (-x.get("population", 0), x["name"]))
+            
+            return {"cities": cities, "total": len(cities)}
+    except Exception as e:
+        logging.error(f"GeoNames cities API error: {e}")
+        return {"cities": [], "error": str(e)}
+
+@api_router.get("/geo/search-cities")
+async def search_cities(query: str, country_code: Optional[str] = None):
+    """Search for cities by name with optional country filter"""
+    if len(query) < 2:
+        return {"cities": []}
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            params = {
+                "name_startsWith": query,
+                "featureClass": "P",
+                "maxRows": 50,
+                "username": GEONAMES_USERNAME,
+                "orderby": "relevance"
+            }
+            
+            if country_code:
+                params["country"] = country_code.upper()
+            
+            response = await client.get(
+                "http://api.geonames.org/searchJSON",
+                params=params,
+                timeout=10.0
+            )
+            data = response.json()
+            
+            if "geonames" not in data:
+                return {"cities": []}
+            
+            cities = []
+            for place in data["geonames"]:
+                cities.append({
+                    "name": place.get("name") or place.get("toponymName"),
+                    "country": place.get("countryName"),
+                    "countryCode": place.get("countryCode"),
+                    "adminName1": place.get("adminName1", ""),
+                    "population": place.get("population", 0)
+                })
+            
+            return {"cities": cities}
+    except Exception as e:
+        logging.error(f"GeoNames search error: {e}")
+        return {"cities": []}
+
+def get_static_countries():
+    """Fallback list of countries if GeoNames API fails"""
+    return [
+        {"name": "Algeria", "code": "DZ"},
+        {"name": "Argentina", "code": "AR"},
+        {"name": "Australia", "code": "AU"},
+        {"name": "Austria", "code": "AT"},
+        {"name": "Belgium", "code": "BE"},
+        {"name": "Brazil", "code": "BR"},
+        {"name": "Canada", "code": "CA"},
+        {"name": "Chile", "code": "CL"},
+        {"name": "China", "code": "CN"},
+        {"name": "Colombia", "code": "CO"},
+        {"name": "Czech Republic", "code": "CZ"},
+        {"name": "Denmark", "code": "DK"},
+        {"name": "Egypt", "code": "EG"},
+        {"name": "Finland", "code": "FI"},
+        {"name": "France", "code": "FR"},
+        {"name": "Germany", "code": "DE"},
+        {"name": "Greece", "code": "GR"},
+        {"name": "Hungary", "code": "HU"},
+        {"name": "India", "code": "IN"},
+        {"name": "Indonesia", "code": "ID"},
+        {"name": "Ireland", "code": "IE"},
+        {"name": "Israel", "code": "IL"},
+        {"name": "Italy", "code": "IT"},
+        {"name": "Japan", "code": "JP"},
+        {"name": "Malaysia", "code": "MY"},
+        {"name": "Mexico", "code": "MX"},
+        {"name": "Morocco", "code": "MA"},
+        {"name": "Netherlands", "code": "NL"},
+        {"name": "New Zealand", "code": "NZ"},
+        {"name": "Norway", "code": "NO"},
+        {"name": "Philippines", "code": "PH"},
+        {"name": "Poland", "code": "PL"},
+        {"name": "Portugal", "code": "PT"},
+        {"name": "Romania", "code": "RO"},
+        {"name": "Russia", "code": "RU"},
+        {"name": "Saudi Arabia", "code": "SA"},
+        {"name": "Singapore", "code": "SG"},
+        {"name": "South Africa", "code": "ZA"},
+        {"name": "South Korea", "code": "KR"},
+        {"name": "Spain", "code": "ES"},
+        {"name": "Sweden", "code": "SE"},
+        {"name": "Switzerland", "code": "CH"},
+        {"name": "Thailand", "code": "TH"},
+        {"name": "Tunisia", "code": "TN"},
+        {"name": "Turkey", "code": "TR"},
+        {"name": "United Arab Emirates", "code": "AE"},
+        {"name": "United Kingdom", "code": "GB"},
+        {"name": "United States", "code": "US"},
+        {"name": "Vietnam", "code": "VN"}
+    ]
+
+
 # Include the router in the main app
 app.include_router(api_router)
 
@@ -3129,6 +3805,62 @@ logger = logging.getLogger(__name__)
 async def startup_event():
     """Initialize services on startup"""
     logging.info("🚀 Starting WalkApp backend...")
+    
+    # Create database indexes for better performance
+    try:
+        logging.info("📊 Creating database indexes...")
+        
+        # Users collection indexes
+        await db.users.create_index("user_id", unique=True)
+        await db.users.create_index("email")
+        await db.users.create_index("city")
+        
+        # Walks collection indexes
+        await db.walks.create_index("walk_id", unique=True)
+        await db.walks.create_index("organizer_id")
+        await db.walks.create_index("date")
+        await db.walks.create_index("city")
+        await db.walks.create_index([("city", 1), ("date", 1)])
+        
+        # Bookings collection indexes
+        await db.bookings.create_index("booking_id", unique=True)
+        await db.bookings.create_index("user_id")
+        await db.bookings.create_index("walk_id")
+        await db.bookings.create_index("status")
+        await db.bookings.create_index([("user_id", 1), ("status", 1)])
+        await db.bookings.create_index([("walk_id", 1), ("status", 1)])
+        
+        # Feedback collection indexes
+        await db.feedback.create_index("feedback_id", unique=True)
+        await db.feedback.create_index("from_user_id")
+        await db.feedback.create_index("to_user_id")
+        await db.feedback.create_index("walk_id")
+        
+        # Experiences collection indexes
+        await db.experiences.create_index("experience_id", unique=True)
+        await db.experiences.create_index("user_id")
+        await db.experiences.create_index("created_at")
+        
+        # Sessions collection indexes
+        await db.user_sessions.create_index("session_token")
+        await db.user_sessions.create_index("user_id")
+        await db.user_sessions.create_index("expires_at")
+        
+        # Admin messages indexes
+        await db.admin_messages.create_index("created_at")
+        await db.admin_messages.create_index("read")
+        
+        # Content reports indexes
+        await db.content_reports.create_index("created_at")
+        await db.content_reports.create_index("status")
+        
+        # Reviews indexes
+        await db.reviews.create_index("walk_id")
+        await db.reviews.create_index("reviewer_id")
+        
+        logging.info("✅ Database indexes created successfully")
+    except Exception as e:
+        logging.warning(f"⚠️ Index creation warning (may already exist): {e}")
     
     # Start the 24h reminder scheduler
     start_reminder_scheduler()
