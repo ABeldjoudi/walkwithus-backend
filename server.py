@@ -294,7 +294,6 @@ async def notify_previous_participants(walk: dict):
         walk_city = walk.get("city", "TBD")
         walk_neighborhood = walk.get("neighborhood", "TBD")
         walk_starting_point = walk.get("starting_point", "TBD")
-        walk_location = f"{walk_city}, {walk_neighborhood} - {walk_starting_point}"
         organizer_name = walk.get("organizer_name", "")
         
         # Push notification - Clear title and body for 35-75 age group
@@ -378,7 +377,6 @@ async def send_walk_reminder(walk_id: str):
         walk_city = walk.get("city", "TBD")
         walk_neighborhood = walk.get("neighborhood", "TBD")
         walk_starting_point = walk.get("starting_point", "TBD")
-        walk_location = f"{walk_city}, {walk_neighborhood} - {walk_starting_point}"
         
         # Push notification - Clear, direct, attention-grabbing for 35-75 age group
         push_title = "⏰ Walk Tomorrow - Don't Forget!"
@@ -468,8 +466,230 @@ async def check_and_send_24h_reminders():
         logging.error(f"Error in check_and_send_24h_reminders: {e}")
 
 
+# ============== Retention Notification System ==============
+
+import random
+
+# Motivational messages for retention notifications
+RETENTION_MESSAGES = [
+    {"title": "👋 We miss you!", "body": "Your walking community is waiting. Join a local walk today!"},
+    {"title": "🚶 Time to walk!", "body": "New walks are available near you. Come explore!"},
+    {"title": "💪 Keep moving!", "body": "Walking is better together. Find your group today!"},
+    {"title": "🌟 Don't miss out!", "body": "Join local walking groups and stay connected."},
+    {"title": "🤝 We grow together!", "body": "Your walking buddies miss you. Come back and join a walk!"},
+]
+
+async def get_weather_message_for_user(user: dict) -> Optional[str]:
+    """Get weather-based message for a user based on their city"""
+    try:
+        # Try to get user's city from their profile or last booking
+        city = user.get('city')
+        
+        if not city:
+            # Try to get from their most recent booking or walk
+            recent_booking = await db.bookings.find_one(
+                {"user_id": user["user_id"]},
+                sort=[("booked_at", -1)]
+            )
+            if recent_booking and recent_booking.get("walk_id"):
+                walk = await db.walks.find_one({"walk_id": recent_booking["walk_id"]})
+                if walk:
+                    city = walk.get("city")
+        
+        if not city:
+            # Try from walks they organized
+            recent_walk = await db.walks.find_one(
+                {"organizer_id": user["user_id"]},
+                sort=[("created_at", -1)]
+            )
+            if recent_walk:
+                city = recent_walk.get("city")
+        
+        if city:
+            # Get weather for tomorrow
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            coords = await get_coordinates(city)
+            
+            if coords:
+                weather = await get_weather_for_date(coords["latitude"], coords["longitude"], tomorrow)
+                
+                if weather and not weather.get("unavailable"):
+                    temp = weather.get("temp_max")
+                    icon = weather.get("icon", "🌤️")
+                    
+                    # Good weather conditions (sunny, partly cloudy, clear)
+                    good_weather_codes = [0, 1, 2, 3]  # Clear, mainly clear, partly cloudy
+                    weather_code = weather.get("weather_code", 99)
+                    
+                    if weather_code in good_weather_codes and temp and temp > 10:
+                        return f"{icon} Beautiful {temp}°C weather for a walk tomorrow in {city}!"
+        
+    except Exception as e:
+        logging.error(f"Error getting weather message: {e}")
+    
+    return None
+
+
+async def get_city_stats(city: str) -> Optional[int]:
+    """Get number of people who walked in a city recently"""
+    try:
+        # Count bookings in the last 7 days for walks in this city
+        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        
+        # Get walks in this city
+        city_walks = await db.walks.find({"city": city}).to_list(length=100)
+        walk_ids = [w["walk_id"] for w in city_walks]
+        
+        if walk_ids:
+            # Count unique users who booked these walks
+            bookings = await db.bookings.find({
+                "walk_id": {"$in": walk_ids},
+                "booked_at": {"$gte": week_ago}
+            }).to_list(length=1000)
+            
+            unique_users = set(b["user_id"] for b in bookings)
+            return len(unique_users)
+    
+    except Exception as e:
+        logging.error(f"Error getting city stats: {e}")
+    
+    return None
+
+
+async def send_retention_notification(user: dict):
+    """Send a retention push notification to an inactive user"""
+    try:
+        user_id = user["user_id"]
+        
+        # Get user's push token
+        push_token_doc = await db.push_tokens.find_one({"user_id": user_id})
+        
+        if not push_token_doc or not push_token_doc.get("push_token"):
+            logging.info(f"No push token for user {user_id}, skipping retention notification")
+            return False
+        
+        push_token = push_token_doc["push_token"]
+        
+        # Check if we already sent a retention notification recently (within 3 days)
+        existing = await db.retention_notifications.find_one({
+            "user_id": user_id,
+            "sent_at": {"$gte": datetime.now(timezone.utc) - timedelta(days=3)}
+        })
+        
+        if existing:
+            logging.info(f"Retention notification already sent recently to {user_id}")
+            return False
+        
+        # Build personalized message
+        title = None
+        body = None
+        
+        # Try weather-based message first (Phase 2)
+        weather_message = await get_weather_message_for_user(user)
+        if weather_message:
+            title = "☀️ Perfect walking weather!"
+            body = weather_message
+        
+        # Try city stats message
+        if not title:
+            city = None
+            recent_walk = await db.walks.find_one(
+                {"organizer_id": user_id},
+                sort=[("created_at", -1)]
+            )
+            if recent_walk:
+                city = recent_walk.get("city")
+            
+            if city:
+                city_walkers = await get_city_stats(city)
+                if city_walkers and city_walkers > 5:
+                    title = f"🚶 {city_walkers} people walked in {city} this week!"
+                    body = "Join them and discover new walking routes."
+        
+        # Fall back to random motivational message
+        if not title:
+            msg = random.choice(RETENTION_MESSAGES)
+            title = msg["title"]
+            body = msg["body"]
+        
+        # Personalize with user's name
+        user_name = user.get("name", "").split()[0] if user.get("name") else None
+        if user_name and len(user_name) > 1:
+            body = f"Hey {user_name}! {body}"
+        
+        # Send the notification
+        try:
+            push_response = push_client.publish(
+                PushMessage(
+                    to=push_token,
+                    title=title,
+                    body=body,
+                    data={"type": "retention", "user_id": user_id}
+                )
+            )
+            
+            # Record that we sent this notification
+            await db.retention_notifications.insert_one({
+                "user_id": user_id,
+                "title": title,
+                "body": body,
+                "sent_at": datetime.now(timezone.utc),
+                "response": str(push_response)
+            })
+            
+            logging.info(f"✅ Retention notification sent to {user_id}: {title}")
+            return True
+            
+        except DeviceNotRegisteredError:
+            # Remove invalid token
+            await db.push_tokens.delete_one({"user_id": user_id})
+            logging.warning(f"Removed invalid push token for user {user_id}")
+            return False
+        except PushServerError as e:
+            logging.error(f"Push server error for {user_id}: {e}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error sending retention notification: {e}")
+        return False
+
+
+async def check_and_send_retention_notifications():
+    """Check for inactive users and send retention notifications (runs daily at 5 PM)"""
+    try:
+        logging.info("🔔 Checking for inactive users to send retention notifications...")
+        
+        # Find users who haven't logged in for 3+ days
+        three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+        
+        # Find inactive users with notifications enabled
+        inactive_users = await db.users.find({
+            "$or": [
+                {"lastLoginAt": {"$lt": three_days_ago}},
+                {"lastLoginAt": {"$exists": False}}
+            ],
+            "notifications_enabled": {"$ne": False}  # Include users where it's True or not set
+        }).to_list(length=100)  # Limit to 100 per run to avoid overload
+        
+        logging.info(f"Found {len(inactive_users)} inactive user(s)")
+        
+        sent_count = 0
+        for user in inactive_users:
+            success = await send_retention_notification(user)
+            if success:
+                sent_count += 1
+            
+            # Add small delay between notifications
+            await asyncio.sleep(0.5)
+        
+        logging.info(f"✅ Sent {sent_count} retention notifications")
+        
+    except Exception as e:
+        logging.error(f"Error in check_and_send_retention_notifications: {e}")
+
+
 def start_reminder_scheduler():
-    """Start the background scheduler for 24h reminders"""
+    """Start the background scheduler for 24h reminders and retention notifications"""
     try:
         # Run every hour to check for walks that need reminders
         scheduler.add_job(
@@ -479,8 +699,20 @@ def start_reminder_scheduler():
             name='24h Walk Reminder',
             replace_existing=True
         )
+        
+        # Run daily at 5 PM UTC (adjust for your timezone if needed)
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler.add_job(
+            check_and_send_retention_notifications,
+            CronTrigger(hour=17, minute=0),  # 5 PM
+            id='retention_job',
+            name='Retention Notifications',
+            replace_existing=True
+        )
+        
         scheduler.start()
         logging.info("✅ 24h reminder scheduler started (runs every hour)")
+        logging.info("✅ Retention notification scheduler started (runs daily at 5 PM)")
     except Exception as e:
         logging.error(f"❌ Failed to start reminder scheduler: {e}")
 
@@ -807,12 +1039,18 @@ async def create_session(request: Request, response: Response):
                 "name": user_data["name"],
                 "picture": user_data.get("picture"),
                 "role": "user",  # Default role
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "lastLoginAt": datetime.now(timezone.utc)
             }
             await db.users.insert_one(new_user)
             user_doc = new_user
         else:
             user_doc = existing_user
+            # Update last login timestamp
+            await db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"lastLoginAt": datetime.now(timezone.utc)}}
+            )
         
         # Create session
         session_token = user_data["session_token"]
@@ -910,13 +1148,19 @@ async def apple_auth(apple_data: AppleAuthRequest, response: Response):
                 "auth_type": "apple",
                 "notifications_enabled": True,
                 "email_notifications": True,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "lastLoginAt": datetime.now(timezone.utc)
             }
             await db.users.insert_one(new_user)
             user_doc = new_user
             logging.info(f"New Apple user created: {user_id}")
         else:
             user_doc = existing_user
+            # Update last login timestamp
+            await db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"lastLoginAt": datetime.now(timezone.utc)}}
+            )
             logging.info(f"Existing Apple user logged in: {user_id}")
         
         # Create session
@@ -1062,6 +1306,12 @@ async def login_user(user_data: UserLogin, response: Response):
         # Verify password
         if not verify_password(user_data.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        # Update last login timestamp
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"lastLoginAt": datetime.now(timezone.utc)}}
+        )
         
         # Create session
         session_token = f"sess_{uuid.uuid4().hex}"
@@ -1570,11 +1820,11 @@ async def get_cities(
     current_user: User = Depends(get_current_user)
 ):
     """Get unique cities from users and walks for auto-suggestion"""
-    # Get unique cities from users
-    user_cities = await db.users.distinct("city", {"city": {"$ne": None, "$ne": ""}})
+    # Get unique cities from users (exclude None and empty strings)
+    user_cities = await db.users.distinct("city", {"city": {"$nin": [None, ""]}})
     
     # Get unique cities from walks
-    walk_cities = await db.walks.distinct("city", {"city": {"$ne": None, "$ne": ""}})
+    walk_cities = await db.walks.distinct("city", {"city": {"$nin": [None, ""]}})
     
     # Combine and deduplicate
     all_cities = list(set(user_cities + walk_cities))
@@ -1596,9 +1846,9 @@ async def get_neighborhoods(
     current_user: User = Depends(get_current_user)
 ):
     """Get unique neighborhoods, optionally filtered by city, for auto-suggestion"""
-    # Build query filter
-    user_filter = {"neighborhood": {"$ne": None, "$ne": ""}}
-    walk_filter = {"neighborhood": {"$ne": None, "$ne": ""}}
+    # Build query filter (exclude None and empty strings)
+    user_filter = {"neighborhood": {"$nin": [None, ""]}}
+    walk_filter = {"neighborhood": {"$nin": [None, ""]}}
     
     if city:
         user_filter["city"] = city
@@ -3041,14 +3291,14 @@ async def get_admin_statistics(
         try:
             start_dt = datetime.fromisoformat(start_date + "T00:00:00")
             user_date_filter["$gte"] = start_dt
-        except:
+        except ValueError:
             pass
     if end_date:
         from datetime import datetime
         try:
             end_dt = datetime.fromisoformat(end_date + "T23:59:59")
             user_date_filter["$lte"] = end_dt
-        except:
+        except ValueError:
             pass
     
     user_query = {}
@@ -3229,6 +3479,139 @@ async def check_admin_status(current_user: User = Depends(get_current_user)):
     return {"is_admin": is_admin(current_user)}
 
 
+@api_router.post("/admin/test-retention-notifications")
+async def test_retention_notifications(current_user: User = Depends(get_current_user)):
+    """
+    [ADMIN ONLY] Manually trigger retention notifications for testing.
+    This will send notifications to users who haven't logged in for 3+ days.
+    """
+    # Check if user is admin
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        logging.info(f"🔔 Admin {current_user.email} triggered retention notification test")
+        
+        # Find users who haven't logged in for 3+ days
+        three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+        
+        inactive_users = await db.users.find({
+            "$or": [
+                {"lastLoginAt": {"$lt": three_days_ago}},
+                {"lastLoginAt": {"$exists": False}}
+            ],
+            "notifications_enabled": {"$ne": False}
+        }).to_list(length=100)
+        
+        results = {
+            "total_inactive_users": len(inactive_users),
+            "notifications_sent": 0,
+            "notifications_skipped": 0,
+            "details": []
+        }
+        
+        for user in inactive_users:
+            user_id = user.get("user_id")
+            user_name = user.get("name", "Unknown")
+            last_login = user.get("lastLoginAt")
+            
+            # Check for push token
+            push_token_doc = await db.push_tokens.find_one({"user_id": user_id})
+            has_token = bool(push_token_doc and push_token_doc.get("push_token"))
+            
+            if has_token:
+                success = await send_retention_notification(user)
+                if success:
+                    results["notifications_sent"] += 1
+                    results["details"].append({
+                        "user": user_name,
+                        "status": "sent",
+                        "last_login": str(last_login) if last_login else "never"
+                    })
+                else:
+                    results["notifications_skipped"] += 1
+                    results["details"].append({
+                        "user": user_name,
+                        "status": "skipped (already sent recently)",
+                        "last_login": str(last_login) if last_login else "never"
+                    })
+            else:
+                results["notifications_skipped"] += 1
+                results["details"].append({
+                    "user": user_name,
+                    "status": "skipped (no push token)",
+                    "last_login": str(last_login) if last_login else "never"
+                })
+            
+            # Small delay between notifications
+            await asyncio.sleep(0.3)
+        
+        logging.info(f"✅ Retention test complete: {results['notifications_sent']} sent, {results['notifications_skipped']} skipped")
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"Error in test retention notifications: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/admin/retention-stats")
+async def get_retention_stats(current_user: User = Depends(get_current_user)):
+    """
+    [ADMIN ONLY] Get statistics about user retention and notifications sent.
+    """
+    # Check if user is admin
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Count total users
+        total_users = await db.users.count_documents({})
+        
+        # Count users with lastLoginAt
+        users_with_login_tracking = await db.users.count_documents({"lastLoginAt": {"$exists": True}})
+        
+        # Count inactive users (3+ days)
+        three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+        inactive_users = await db.users.count_documents({
+            "$or": [
+                {"lastLoginAt": {"$lt": three_days_ago}},
+                {"lastLoginAt": {"$exists": False}}
+            ]
+        })
+        
+        # Count active users (logged in within 3 days)
+        active_users = await db.users.count_documents({
+            "lastLoginAt": {"$gte": three_days_ago}
+        })
+        
+        # Count retention notifications sent
+        total_notifications = await db.retention_notifications.count_documents({})
+        
+        # Notifications sent in last 7 days
+        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        recent_notifications = await db.retention_notifications.count_documents({
+            "sent_at": {"$gte": week_ago}
+        })
+        
+        # Users with push tokens
+        users_with_tokens = await db.push_tokens.count_documents({})
+        
+        return {
+            "total_users": total_users,
+            "users_with_login_tracking": users_with_login_tracking,
+            "active_users_3_days": active_users,
+            "inactive_users_3_days": inactive_users,
+            "users_with_push_tokens": users_with_tokens,
+            "total_retention_notifications_sent": total_notifications,
+            "notifications_sent_last_7_days": recent_notifications
+        }
+        
+    except Exception as e:
+        logging.error(f"Error getting retention stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============== Walk Tracking Stats Endpoints ==============
 
 class WalkStatsSync(BaseModel):
@@ -3385,7 +3768,7 @@ async def get_terms_status(current_user: User = Depends(get_current_user)):
             # Handle string format if stored that way
             try:
                 accepted_dt = datetime.fromisoformat(str(terms_accepted_at).replace('Z', '+00:00'))
-            except:
+            except (ValueError, TypeError):
                 accepted_dt = None
         
         if accepted_dt:
