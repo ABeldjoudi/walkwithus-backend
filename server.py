@@ -1446,6 +1446,81 @@ async def cleanup_old_data(current_user: User = Depends(get_current_user)):
         "details": results
     }
 
+
+# TEMPORARY: One-time cleanup endpoint (no auth required) - DELETE THIS AFTER USE!
+@api_router.get("/admin/run-cleanup-now")
+async def run_cleanup_now(secret: str = ""):
+    """
+    TEMPORARY endpoint to run cleanup without auth.
+    Call with: /api/admin/run-cleanup-now?secret=walkwithus2025cleanup
+    DELETE THIS ENDPOINT AFTER USING IT!
+    """
+    if secret != "walkwithus2025cleanup":
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    test_user_emails = [
+        "abdelkaderbeldjoudi@gmail.com",
+        "abdelkaderbeldjoudi8@gmail.com", 
+        "kbeldjoudi@hotmail.com"
+    ]
+    
+    # Get user IDs for test users
+    test_users = await db.users.find({"email": {"$in": test_user_emails}}).to_list(10)
+    test_user_ids = [str(u["_id"]) for u in test_users] + [u.get("google_id") for u in test_users if u.get("google_id")]
+    
+    results = {
+        "walks_deleted": 0,
+        "bookings_deleted": 0,
+        "details": []
+    }
+    
+    # 1. Find walks to delete: created before Feb 10, 2025 by test users
+    cutoff_date = datetime(2025, 2, 10)
+    
+    old_walks_query = {
+        "$and": [
+            {"organizer_id": {"$in": test_user_ids}},
+            {"created_at": {"$lt": cutoff_date}}
+        ]
+    }
+    
+    old_walks = await db.walks.find(old_walks_query).to_list(1000)
+    old_walk_ids = [w["walk_id"] for w in old_walks]
+    
+    if old_walk_ids:
+        bookings_result = await db.bookings.delete_many({"walk_id": {"$in": old_walk_ids}})
+        results["bookings_deleted"] += bookings_result.deleted_count
+        walks_result = await db.walks.delete_many({"walk_id": {"$in": old_walk_ids}})
+        results["walks_deleted"] += walks_result.deleted_count
+        results["details"].append(f"Deleted {walks_result.deleted_count} walks created before Feb 10, 2025")
+    
+    # 2. Find walks scheduled for 2026
+    walks_2026 = await db.walks.find({"date": {"$regex": "^2026-"}}).to_list(1000)
+    walks_2026_ids = [w["walk_id"] for w in walks_2026]
+    
+    if walks_2026_ids:
+        bookings_result = await db.bookings.delete_many({"walk_id": {"$in": walks_2026_ids}})
+        results["bookings_deleted"] += bookings_result.deleted_count
+        walks_result = await db.walks.delete_many({"walk_id": {"$in": walks_2026_ids}})
+        results["walks_deleted"] += walks_result.deleted_count
+        results["details"].append(f"Deleted {walks_result.deleted_count} walks scheduled for 2026")
+    
+    # 3. Clean up orphaned bookings
+    all_walk_ids = await db.walks.distinct("walk_id")
+    orphaned_bookings = await db.bookings.delete_many({"walk_id": {"$nin": all_walk_ids}})
+    if orphaned_bookings.deleted_count > 0:
+        results["bookings_deleted"] += orphaned_bookings.deleted_count
+        results["details"].append(f"Deleted {orphaned_bookings.deleted_count} orphaned bookings")
+    
+    logging.info(f"[Cleanup] One-time cleanup executed: {results}")
+    
+    return {
+        "success": True,
+        "message": f"Cleanup complete: {results['walks_deleted']} walks and {results['bookings_deleted']} bookings deleted",
+        "details": results,
+        "WARNING": "DELETE THIS ENDPOINT FROM server.py AFTER USE!"
+    }
+
 @api_router.post("/auth/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
     """Request a password reset - generates a 6-digit code"""
