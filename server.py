@@ -737,7 +737,7 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 # GeoNames configuration
-GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME", "demo")  # Replace with actual username
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME", "abeldjoudi")  # GeoNames username for API access
 
 class User(BaseModel):
     user_id: str
@@ -4179,6 +4179,7 @@ async def get_cities_by_country(country_code: str, query: str = ""):
         country_code: ISO 2-letter country code (e.g., 'DZ' for Algeria)
         query: Optional search query to filter cities
     """
+    # Try GeoNames API first (full data)
     try:
         async with httpx.AsyncClient() as client:
             # Use GeoNames search to get cities
@@ -4203,6 +4204,10 @@ async def get_cities_by_country(country_code: str, query: str = ""):
             
             if "geonames" not in data:
                 logging.error(f"GeoNames response: {data}")
+                # Fallback to static if GeoNames fails
+                static_cities = get_static_cities(country_code.upper())
+                if static_cities:
+                    return {"cities": static_cities, "total": len(static_cities), "source": "static_fallback"}
                 return {"cities": [], "error": "Failed to fetch cities"}
             
             cities = []
@@ -4222,9 +4227,13 @@ async def get_cities_by_country(country_code: str, query: str = ""):
             # Sort by population (largest first), then alphabetically
             cities.sort(key=lambda x: (-x.get("population", 0), x["name"]))
             
-            return {"cities": cities, "total": len(cities)}
+            return {"cities": cities, "total": len(cities), "source": "geonames"}
     except Exception as e:
         logging.error(f"GeoNames cities API error: {e}")
+        # Fallback to static on error
+        static_cities = get_static_cities(country_code.upper())
+        if static_cities:
+            return {"cities": static_cities, "total": len(static_cities), "source": "static_fallback"}
         return {"cities": [], "error": str(e)}
 
 @api_router.get("/geo/search-cities")
@@ -4324,6 +4333,207 @@ def get_static_countries():
         {"name": "United States", "code": "US"},
         {"name": "Vietnam", "code": "VN"}
     ]
+
+
+def get_static_cities(country_code: str):
+    """Static fallback list of major cities for common countries"""
+    cities_data = {
+        "DZ": [  # Algeria
+            {"name": "Algiers", "adminName1": "Algiers"},
+            {"name": "Oran", "adminName1": "Oran"},
+            {"name": "Constantine", "adminName1": "Constantine"},
+            {"name": "Annaba", "adminName1": "Annaba"},
+            {"name": "Blida", "adminName1": "Blida"},
+            {"name": "Batna", "adminName1": "Batna"},
+            {"name": "Djelfa", "adminName1": "Djelfa"},
+            {"name": "Sétif", "adminName1": "Sétif"},
+            {"name": "Sidi Bel Abbès", "adminName1": "Sidi Bel Abbès"},
+            {"name": "Biskra", "adminName1": "Biskra"},
+            {"name": "Tébessa", "adminName1": "Tébessa"},
+            {"name": "Tlemcen", "adminName1": "Tlemcen"},
+            {"name": "Béjaïa", "adminName1": "Béjaïa"},
+            {"name": "Tiaret", "adminName1": "Tiaret"},
+            {"name": "Bordj Bou Arréridj", "adminName1": "Bordj Bou Arréridj"},
+        ],
+        "CA": [  # Canada
+            {"name": "Toronto", "adminName1": "Ontario"},
+            {"name": "Montreal", "adminName1": "Quebec"},
+            {"name": "Vancouver", "adminName1": "British Columbia"},
+            {"name": "Calgary", "adminName1": "Alberta"},
+            {"name": "Edmonton", "adminName1": "Alberta"},
+            {"name": "Ottawa", "adminName1": "Ontario"},
+            {"name": "Winnipeg", "adminName1": "Manitoba"},
+            {"name": "Quebec City", "adminName1": "Quebec"},
+            {"name": "Hamilton", "adminName1": "Ontario"},
+            {"name": "Kitchener", "adminName1": "Ontario"},
+            {"name": "London", "adminName1": "Ontario"},
+            {"name": "Victoria", "adminName1": "British Columbia"},
+            {"name": "Halifax", "adminName1": "Nova Scotia"},
+            {"name": "Oshawa", "adminName1": "Ontario"},
+            {"name": "Windsor", "adminName1": "Ontario"},
+            {"name": "Saskatoon", "adminName1": "Saskatchewan"},
+            {"name": "Regina", "adminName1": "Saskatchewan"},
+            {"name": "Sherbrooke", "adminName1": "Quebec"},
+            {"name": "St. John's", "adminName1": "Newfoundland"},
+            {"name": "Barrie", "adminName1": "Ontario"},
+        ],
+        "US": [  # United States
+            {"name": "New York", "adminName1": "New York"},
+            {"name": "Los Angeles", "adminName1": "California"},
+            {"name": "Chicago", "adminName1": "Illinois"},
+            {"name": "Houston", "adminName1": "Texas"},
+            {"name": "Phoenix", "adminName1": "Arizona"},
+            {"name": "Philadelphia", "adminName1": "Pennsylvania"},
+            {"name": "San Antonio", "adminName1": "Texas"},
+            {"name": "San Diego", "adminName1": "California"},
+            {"name": "Dallas", "adminName1": "Texas"},
+            {"name": "San Jose", "adminName1": "California"},
+            {"name": "Austin", "adminName1": "Texas"},
+            {"name": "Jacksonville", "adminName1": "Florida"},
+            {"name": "Fort Worth", "adminName1": "Texas"},
+            {"name": "Columbus", "adminName1": "Ohio"},
+            {"name": "Charlotte", "adminName1": "North Carolina"},
+            {"name": "San Francisco", "adminName1": "California"},
+            {"name": "Indianapolis", "adminName1": "Indiana"},
+            {"name": "Seattle", "adminName1": "Washington"},
+            {"name": "Denver", "adminName1": "Colorado"},
+            {"name": "Washington D.C.", "adminName1": "District of Columbia"},
+            {"name": "Boston", "adminName1": "Massachusetts"},
+            {"name": "Nashville", "adminName1": "Tennessee"},
+            {"name": "Detroit", "adminName1": "Michigan"},
+            {"name": "Portland", "adminName1": "Oregon"},
+            {"name": "Las Vegas", "adminName1": "Nevada"},
+            {"name": "Miami", "adminName1": "Florida"},
+            {"name": "Atlanta", "adminName1": "Georgia"},
+        ],
+        "FR": [  # France
+            {"name": "Paris", "adminName1": "Île-de-France"},
+            {"name": "Marseille", "adminName1": "Provence-Alpes-Côte d'Azur"},
+            {"name": "Lyon", "adminName1": "Auvergne-Rhône-Alpes"},
+            {"name": "Toulouse", "adminName1": "Occitanie"},
+            {"name": "Nice", "adminName1": "Provence-Alpes-Côte d'Azur"},
+            {"name": "Nantes", "adminName1": "Pays de la Loire"},
+            {"name": "Strasbourg", "adminName1": "Grand Est"},
+            {"name": "Montpellier", "adminName1": "Occitanie"},
+            {"name": "Bordeaux", "adminName1": "Nouvelle-Aquitaine"},
+            {"name": "Lille", "adminName1": "Hauts-de-France"},
+            {"name": "Rennes", "adminName1": "Brittany"},
+            {"name": "Reims", "adminName1": "Grand Est"},
+            {"name": "Le Havre", "adminName1": "Normandy"},
+            {"name": "Saint-Étienne", "adminName1": "Auvergne-Rhône-Alpes"},
+            {"name": "Toulon", "adminName1": "Provence-Alpes-Côte d'Azur"},
+        ],
+        "GB": [  # United Kingdom
+            {"name": "London", "adminName1": "England"},
+            {"name": "Birmingham", "adminName1": "England"},
+            {"name": "Manchester", "adminName1": "England"},
+            {"name": "Leeds", "adminName1": "England"},
+            {"name": "Glasgow", "adminName1": "Scotland"},
+            {"name": "Liverpool", "adminName1": "England"},
+            {"name": "Newcastle", "adminName1": "England"},
+            {"name": "Sheffield", "adminName1": "England"},
+            {"name": "Bristol", "adminName1": "England"},
+            {"name": "Edinburgh", "adminName1": "Scotland"},
+            {"name": "Leicester", "adminName1": "England"},
+            {"name": "Coventry", "adminName1": "England"},
+            {"name": "Belfast", "adminName1": "Northern Ireland"},
+            {"name": "Nottingham", "adminName1": "England"},
+            {"name": "Cardiff", "adminName1": "Wales"},
+        ],
+        "DE": [  # Germany
+            {"name": "Berlin", "adminName1": "Berlin"},
+            {"name": "Hamburg", "adminName1": "Hamburg"},
+            {"name": "Munich", "adminName1": "Bavaria"},
+            {"name": "Cologne", "adminName1": "North Rhine-Westphalia"},
+            {"name": "Frankfurt", "adminName1": "Hesse"},
+            {"name": "Stuttgart", "adminName1": "Baden-Württemberg"},
+            {"name": "Düsseldorf", "adminName1": "North Rhine-Westphalia"},
+            {"name": "Leipzig", "adminName1": "Saxony"},
+            {"name": "Dortmund", "adminName1": "North Rhine-Westphalia"},
+            {"name": "Essen", "adminName1": "North Rhine-Westphalia"},
+            {"name": "Bremen", "adminName1": "Bremen"},
+            {"name": "Dresden", "adminName1": "Saxony"},
+            {"name": "Hanover", "adminName1": "Lower Saxony"},
+            {"name": "Nuremberg", "adminName1": "Bavaria"},
+            {"name": "Duisburg", "adminName1": "North Rhine-Westphalia"},
+        ],
+        "ES": [  # Spain
+            {"name": "Madrid", "adminName1": "Madrid"},
+            {"name": "Barcelona", "adminName1": "Catalonia"},
+            {"name": "Valencia", "adminName1": "Valencia"},
+            {"name": "Seville", "adminName1": "Andalusia"},
+            {"name": "Zaragoza", "adminName1": "Aragon"},
+            {"name": "Málaga", "adminName1": "Andalusia"},
+            {"name": "Murcia", "adminName1": "Murcia"},
+            {"name": "Palma", "adminName1": "Balearic Islands"},
+            {"name": "Las Palmas", "adminName1": "Canary Islands"},
+            {"name": "Bilbao", "adminName1": "Basque Country"},
+        ],
+        "IT": [  # Italy
+            {"name": "Rome", "adminName1": "Lazio"},
+            {"name": "Milan", "adminName1": "Lombardy"},
+            {"name": "Naples", "adminName1": "Campania"},
+            {"name": "Turin", "adminName1": "Piedmont"},
+            {"name": "Palermo", "adminName1": "Sicily"},
+            {"name": "Genoa", "adminName1": "Liguria"},
+            {"name": "Bologna", "adminName1": "Emilia-Romagna"},
+            {"name": "Florence", "adminName1": "Tuscany"},
+            {"name": "Bari", "adminName1": "Apulia"},
+            {"name": "Catania", "adminName1": "Sicily"},
+            {"name": "Venice", "adminName1": "Veneto"},
+            {"name": "Verona", "adminName1": "Veneto"},
+        ],
+        "AU": [  # Australia
+            {"name": "Sydney", "adminName1": "New South Wales"},
+            {"name": "Melbourne", "adminName1": "Victoria"},
+            {"name": "Brisbane", "adminName1": "Queensland"},
+            {"name": "Perth", "adminName1": "Western Australia"},
+            {"name": "Adelaide", "adminName1": "South Australia"},
+            {"name": "Gold Coast", "adminName1": "Queensland"},
+            {"name": "Canberra", "adminName1": "Australian Capital Territory"},
+            {"name": "Newcastle", "adminName1": "New South Wales"},
+            {"name": "Hobart", "adminName1": "Tasmania"},
+            {"name": "Darwin", "adminName1": "Northern Territory"},
+        ],
+        "MA": [  # Morocco
+            {"name": "Casablanca", "adminName1": "Casablanca-Settat"},
+            {"name": "Rabat", "adminName1": "Rabat-Salé-Kénitra"},
+            {"name": "Fes", "adminName1": "Fès-Meknès"},
+            {"name": "Marrakech", "adminName1": "Marrakech-Safi"},
+            {"name": "Tangier", "adminName1": "Tanger-Tétouan-Al Hoceïma"},
+            {"name": "Agadir", "adminName1": "Souss-Massa"},
+            {"name": "Meknes", "adminName1": "Fès-Meknès"},
+            {"name": "Oujda", "adminName1": "Oriental"},
+            {"name": "Kenitra", "adminName1": "Rabat-Salé-Kénitra"},
+            {"name": "Tetouan", "adminName1": "Tanger-Tétouan-Al Hoceïma"},
+        ],
+        "TN": [  # Tunisia
+            {"name": "Tunis", "adminName1": "Tunis"},
+            {"name": "Sfax", "adminName1": "Sfax"},
+            {"name": "Sousse", "adminName1": "Sousse"},
+            {"name": "Kairouan", "adminName1": "Kairouan"},
+            {"name": "Bizerte", "adminName1": "Bizerte"},
+            {"name": "Gabès", "adminName1": "Gabès"},
+            {"name": "Ariana", "adminName1": "Ariana"},
+            {"name": "Gafsa", "adminName1": "Gafsa"},
+            {"name": "Monastir", "adminName1": "Monastir"},
+            {"name": "Ben Arous", "adminName1": "Ben Arous"},
+        ],
+        "EG": [  # Egypt
+            {"name": "Cairo", "adminName1": "Cairo"},
+            {"name": "Alexandria", "adminName1": "Alexandria"},
+            {"name": "Giza", "adminName1": "Giza"},
+            {"name": "Shubra El Kheima", "adminName1": "Qalyubia"},
+            {"name": "Port Said", "adminName1": "Port Said"},
+            {"name": "Suez", "adminName1": "Suez"},
+            {"name": "Luxor", "adminName1": "Luxor"},
+            {"name": "Mansoura", "adminName1": "Dakahlia"},
+            {"name": "Tanta", "adminName1": "Gharbia"},
+            {"name": "Asyut", "adminName1": "Asyut"},
+        ],
+    }
+    
+    return cities_data.get(country_code, None)
 
 
 # Include the router in the main app
